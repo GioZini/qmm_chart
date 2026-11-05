@@ -1,0 +1,989 @@
+---
+title: "multimodel_q_chart"
+author: "Giovanni Zini"
+date: "2026-05-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r pacotes, message=FALSE,warning=FALSE}
+
+library(dplyr)
+library(qcc)
+library(tidyr)
+library(ggplot2)
+library(ggthemes)
+library(mvtnorm)
+library(forecast)
+library(kableExtra)
+library(doParallel)
+library(foreach)
+library(doSNOW)
+library(binom)
+
+```
+
+```{r funcoes}
+
+#### =========================================================
+#### Simulação condicionada para ARMA(p,q)
+#### =========================================================
+
+arima_structbreak_sim <- function(n,
+                                  coefs,
+                                  ordem,
+                                  y,
+                                  eps,
+                                  sd = 1) {
+  
+  repeat {
+    
+    result <- tryCatch({
+      
+      p <- ordem[1]
+      q <- ordem[3]
+      
+      ar_coefs <- if (p > 0) {
+        coefs[grep("^ar", names(coefs))]
+      } else {
+        numeric(0)
+      }
+      
+      ma_coefs <- if (q > 0) {
+        coefs[grep("^ma", names(coefs))]
+      } else {
+        numeric(0)
+      }
+      
+      novos_eps <- rnorm(n, sd = sd)
+      novo_y <- numeric(n)
+      
+      y_hist <- as.numeric(y)
+      eps_hist <- as.numeric(eps)
+      
+      for (t in 1:n) {
+        
+        ar_part <- 0
+        
+        if (p > 0) {
+          for (i in 1:p) {
+            ar_part <- ar_part +
+              ar_coefs[i] *
+              y_hist[length(y_hist) - i + 1]
+          }
+        }
+        
+        ma_part <- 0
+        
+        if (q > 0) {
+          for (j in 1:q) {
+            ma_part <- ma_part +
+              ma_coefs[j] *
+              eps_hist[length(eps_hist) - j + 1]
+          }
+        }
+        
+        novo_y[t] <- ar_part + novos_eps[t] + ma_part
+        
+        y_hist <- c(y_hist, novo_y[t])
+        eps_hist <- c(eps_hist, novos_eps[t])
+      }
+      
+      novo_y
+      
+    }, error = function(e) NULL)
+    
+    if (!is.null(result)) break
+  }
+  
+  return(result)
+}
+
+
+
+#### =========================================================
+#### Simulação do processo com quebra estrutural
+#### =========================================================
+
+simula_processo <- function(n,
+                            fase1_coefs,
+                            fase2_coefs,
+                            order = c(1,0,1),
+                            sd = 1,
+                            burn_in = 1000) {
+  
+  repeat {
+    
+    result <- tryCatch({
+      
+      p <- order[1]
+      q <- order[3]
+      
+      n_total <- burn_in + 2*n
+      
+      eps <- rnorm(n_total, sd = sd)
+      y <- numeric(n_total)
+      
+      for (t in (max(p,q)+1):n_total) {
+        
+        if (t <= burn_in + n) {
+          ar_coefs <- fase1_coefs[grep("^ar", names(fase1_coefs))]
+          ma_coefs <- fase1_coefs[grep("^ma", names(fase1_coefs))]
+        } else {
+          ar_coefs <- fase2_coefs[grep("^ar", names(fase2_coefs))]
+          ma_coefs <- fase2_coefs[grep("^ma", names(fase2_coefs))]
+        }
+        
+        ar_part <- 0
+        
+        if (p > 0) {
+          for (i in 1:p) {
+            ar_part <- ar_part + ar_coefs[i] * y[t-i]
+          }
+        }
+        
+        ma_part <- 0
+        
+        if (q > 0) {
+          for (j in 1:q) {
+            ma_part <- ma_part + ma_coefs[j] * eps[t-j]
+          }
+        }
+        
+        y[t] <- ar_part + eps[t] + ma_part
+      }
+      
+      y_fase1 <- y[(burn_in+1):(burn_in+n)]
+      y_fase2 <- y[(burn_in+n+1):(burn_in+2*n)]
+      
+      eps_fase1 <- eps[(burn_in+1):(burn_in+n)]
+      eps_fase2 <- eps[(burn_in+n+1):(burn_in+2*n)]
+      
+      fit <- auto.arima(
+        y_fase1,
+        seasonal = FALSE,
+        stationary = TRUE,
+        allowmean = FALSE,
+        allowdrift = FALSE
+      )
+      
+      list(
+        fase1 = y_fase1,
+        fase2 = y_fase2,
+        eps_fase1 = eps_fase1,
+        eps_fase2 = eps_fase2,
+        fit = fit
+      )
+      
+    }, error = function(e) NULL)
+    
+    if (!is.null(result)) break
+  }
+  
+  return(result)
+}
+
+
+
+#### =========================================================
+#### Ajuste multimodelo
+#### =========================================================
+
+ajustar_modelos <- function(serie,
+                            modelos_df,
+                            criterio = "aic",
+                            cutoff = NULL) {
+  
+  resultados <- list()
+  ics <- numeric(nrow(modelos_df))
+  
+  for (i in 1:nrow(modelos_df)) {
+    
+    p <- modelos_df$p[i]
+    q <- modelos_df$q[i]
+    
+    tryCatch({
+      
+      modelo <- Arima(
+        serie,
+        order = c(p,0,q),
+        include.mean = FALSE
+      )
+      
+      resultados[[i]] <- modelo
+      ics[i] <- modelo[[criterio]]
+      
+    }, error = function(e) {
+      
+      resultados[[i]] <- NULL
+      ics[i] <<- Inf
+      
+    })
+  }
+  
+  delta_ic <- ics - min(ics, na.rm = TRUE)
+  
+  pesos <- exp(-delta_ic/2) /
+    sum(exp(-delta_ic/2), na.rm = TRUE)
+  
+  if (is.null(cutoff)) {
+    return(
+      list(
+        modelos = resultados,
+        pesos = pesos,
+        ics = ics,
+        modelos_df = modelos_df
+      )
+    )
+  }
+  
+  substantial <- which(delta_ic <= cutoff)
+  
+  pesos_cut <- exp(-(ics[substantial] - min(ics[substantial]))/2)
+  pesos_cut <- pesos_cut / sum(pesos_cut)
+  
+  return(
+    list(
+      modelos = resultados[substantial],
+      pesos = pesos_cut,
+      ics = ics[substantial],
+      modelos_df = modelos_df[substantial,]
+    )
+  )
+}
+
+
+
+#### =========================================================
+#### Estatística multimodelo Q
+#### =========================================================
+
+multimodel_Q <- function(serie,
+                         resultados_mmi,
+                         lag_q = 10) {
+  
+  modelos_validos <- which(resultados_mmi$pesos > 0)
+  
+  pesos <- resultados_mmi$pesos[modelos_validos]
+  
+  stats <- numeric(length(modelos_validos))
+  
+  for (i in seq_along(modelos_validos)) {
+    
+    m <- modelos_validos[i]
+    
+    modelo <- resultados_mmi$modelos[[m]]
+    
+    ajuste <- Arima(
+      serie,
+      include.mean = FALSE,
+      order = arimaorder(modelo),
+      fixed = modelo$coef
+    )
+    
+    q_i <- Box.test(
+      ajuste$residuals,
+      lag = lag_q,
+      type = "Ljung-Box"
+    )$statistic
+    
+    stats[i] <- q_i
+  }
+  
+  pesos <- pesos / sum(pesos)
+  
+  stat_mm <- sum(stats * pesos)
+  
+  return(as.numeric(stat_mm))
+}
+
+
+
+#### =========================================================
+#### Bootstrap multimodelo
+#### =========================================================
+
+bootstrap_multimodelo <- function(resultados_mmi,
+                                  fase1,
+                                  eps_fase1,
+                                  lag,
+                                  n_boot = 500,
+                                  lag_q = 10) {
+  
+  pesos <- resultados_mmi$pesos
+  
+  modelos_validos <- which(pesos > 0)
+  
+  n <- length(fase1)
+  
+  boot <- numeric(n_boot)
+  
+  for (b in 1:n_boot) {
+    
+    modelo_idx <- sample(
+      modelos_validos,
+      size = 1,
+      prob = pesos[modelos_validos]
+    )
+    
+    modelo <- resultados_mmi$modelos[[modelo_idx]]
+    
+    ordem <- arimaorder(modelo)
+    
+    success <- FALSE
+    attempt <- 0
+    
+    while (!success && attempt < 1000) {
+      
+      attempt <- attempt + 1
+      
+      tryCatch({
+        
+        if (length(modelo$coef) == 1) {
+          
+          coef_star <- rnorm(
+            1,
+            modelo$coef,
+            sqrt(modelo$var.coef)
+          )
+          
+          names(coef_star) <- names(modelo$coef)
+          
+        } else {
+          
+          coef_star <- rmvnorm(
+            1,
+            modelo$coef,
+            modelo$var.coef
+          )[1,]
+        }
+        
+        y_star <- arima_structbreak_sim(
+          n = lag,
+          coefs = coef_star,
+          ordem = ordem,
+          y = fase1,
+          eps = eps_fase1,
+          sd = sqrt(modelo$sigma2)
+        )
+        
+        success <- TRUE
+        
+      }, error = function(e){})
+    }
+    
+    if (!success) {
+      stop("Falha no bootstrap.")
+    }
+    
+    if (lag < n) {
+      colagem <- c(fase1[(lag+1):n], y_star)
+    } else {
+      colagem <- y_star
+    }
+    
+    boot[b] <- multimodel_Q(
+      serie = colagem,
+      resultados_mmi = resultados_mmi,
+      lag_q = lag_q
+    )
+  }
+  
+  return(boot)
+}
+
+
+
+#### =========================================================
+#### Auxiliares para cartas de resíduos (CUSUM e EWMA)
+#### =========================================================
+
+# Resíduos de um modelo com coeficientes fixos aplicado a uma série qualquer
+residuos_fixos <- function(serie, fit) {
+  
+  if (length(fit$coef) == 0) return(as.numeric(serie))
+  
+  ajuste <- Arima(
+    serie,
+    include.mean = FALSE,
+    order = arimaorder(fit),
+    fixed = fit$coef
+  )
+  
+  as.numeric(ajuste$residuals)
+}
+
+# Sorteio de coeficientes ~ N(coef, var.coef)
+amostra_coef <- function(fit) {
+  
+  k <- length(fit$coef)
+  
+  if (k == 0) return(numeric(0))
+  
+  if (k == 1) {
+    coef_star <- rnorm(1, fit$coef, sqrt(fit$var.coef))
+  } else {
+    coef_star <- rmvnorm(1, fit$coef, fit$var.coef)[1, ]
+  }
+  
+  names(coef_star) <- names(fit$coef)
+  coef_star
+}
+
+# Estatística EWMA: max_t |z_t| / sd_t (sd exato de z_t sob H0)
+ewma_stat <- function(res_padrao, lambda = 0.2) {
+  
+  L <- length(res_padrao)
+  z <- numeric(L)
+  z_ant <- 0
+  
+  for (t in 1:L) {
+    z_ant <- lambda * res_padrao[t] + (1 - lambda) * z_ant
+    z[t] <- z_ant
+  }
+  
+  sd_t <- sqrt(lambda / (2 - lambda) * (1 - (1 - lambda)^(2 * (1:L))))
+  
+  max(abs(z) / sd_t)
+}
+
+# Estatística CUSUM bilateral (Page, 1954) sobre resíduos padronizados:
+#   C+_t = max(0, C+_{t-1} + z_t - k)
+#   C-_t = max(0, C-_{t-1} - z_t - k)
+# Estatística da carta: max_t max(C+_t, C-_t). Sinaliza se > h.
+# k (valor de referência/folga) é fixado pela literatura; h é calibrado por bootstrap.
+cusum_stat <- function(res_padrao, k = 0.5) {
+  
+  c_pos <- 0
+  c_neg <- 0
+  maximo <- 0
+  
+  for (t in seq_along(res_padrao)) {
+    c_pos <- max(0, c_pos + res_padrao[t] - k)
+    c_neg <- max(0, c_neg - res_padrao[t] - k)
+    maximo <- max(maximo, c_pos, c_neg)
+  }
+  
+  maximo
+}
+
+# Bootstrap da estatística EWMA sob H0 (calibra o multiplicador k)
+bootstrap_ewma <- function(fit,
+                           fase1,
+                           eps_fase1,
+                           lag,
+                           n_boot = 500,
+                           lambda = 0.2) {
+  
+  n <- length(fase1)
+  ordem <- arimaorder(fit)
+  s <- sqrt(fit$sigma2)
+  
+  boot <- numeric(n_boot)
+  
+  for (b in 1:n_boot) {
+    
+    coef_star <- amostra_coef(fit)
+    
+    y_star <- arima_structbreak_sim(
+      n = lag,
+      coefs = coef_star,
+      ordem = ordem,
+      y = fase1,
+      eps = eps_fase1,
+      sd = s
+    )
+    
+    colagem <- if (lag < n) c(fase1[(lag + 1):n], y_star) else y_star
+    
+    res <- residuos_fixos(colagem, fit)
+    
+    boot[b] <- ewma_stat(tail(res, lag) / s, lambda)
+  }
+  
+  boot
+}
+
+# Bootstrap da estatística CUSUM sob H0 (calibra o intervalo de decisão h)
+bootstrap_cusum <- function(fit,
+                            fase1,
+                            eps_fase1,
+                            lag,
+                            n_boot = 500,
+                            k = 0.5) {
+  
+  n <- length(fase1)
+  ordem <- arimaorder(fit)
+  s <- sqrt(fit$sigma2)
+  
+  boot <- numeric(n_boot)
+  
+  for (b in 1:n_boot) {
+    
+    coef_star <- amostra_coef(fit)
+    
+    y_star <- arima_structbreak_sim(
+      n = lag,
+      coefs = coef_star,
+      ordem = ordem,
+      y = fase1,
+      eps = eps_fase1,
+      sd = s
+    )
+    
+    colagem <- if (lag < n) c(fase1[(lag + 1):n], y_star) else y_star
+    
+    res <- residuos_fixos(colagem, fit)
+    
+    boot[b] <- cusum_stat(tail(res, lag) / s, k)
+  }
+  
+  boot
+}
+
+
+
+#### =========================================================
+#### Teste de poder (Q multimodelo, resíduo, CUSUM, EWMA)
+#### =========================================================
+
+power_test <- function(n,
+                       lag,
+                       n_mc,
+                       n_boot = 500,
+                       alpha = 0.05,
+                       lag_q = 10,
+                       max.p = 2,
+                       max.q = 2,
+                       criterio = "aicc",
+                       cutoff = NULL,
+                       order = c(1,0,1),
+                       h0_model,
+                       h1_model,
+                       burn_in = 1000,
+                       lambda_ewma = 0.2,
+                       k_cusum = 0.5) {
+  
+  violations_q    <- numeric(n_mc)
+  violations_res  <- numeric(n_mc)
+  violations_cusum <- numeric(n_mc)
+  violations_ewma <- numeric(n_mc)
+  
+  modelos_candidatos <- expand.grid(p = 0:max.p, q = 0:max.q)
+  modelos_candidatos <- modelos_candidatos[
+    !(modelos_candidatos$p == 0 & modelos_candidatos$q == 0), ]
+  
+  for (m in 1:n_mc) {
+    
+    processo <- simula_processo(
+      n = n,
+      fase1_coefs = h0_model,
+      fase2_coefs = h1_model,
+      order = order,
+      burn_in = burn_in
+    )
+    
+    h0     <- processo$fase1
+    h0_eps <- processo$eps_fase1
+    
+    #### Multimodelo para Q
+    h0_mmi <- ajustar_modelos(
+      serie = h0,
+      modelos_df = modelos_candidatos,
+      criterio = criterio,
+      cutoff = cutoff
+    )
+    
+    #### auto.arima (base das cartas de resíduos)
+    fit_auto <- auto.arima(
+      h0,
+      seasonal = FALSE,
+      stationary = TRUE,
+      allowmean = FALSE,
+      allowdrift = FALSE
+    )
+    
+    if (lag < n) {
+      h1 <- processo$fase2[1:lag]
+      colagem <- c(h0[(lag+1):n], h1)
+    } else {
+      h1 <- processo$fase2
+      colagem <- h1
+    }
+    
+    #### -------------------------------------------
+    #### 1) Q multimodelo
+    #### -------------------------------------------
+    q_obs <- multimodel_Q(
+      serie = colagem,
+      resultados_mmi = h0_mmi,
+      lag_q = lag_q
+    )
+    
+    boot_q <- bootstrap_multimodelo(
+      resultados_mmi = h0_mmi,
+      fase1 = h0,
+      eps_fase1 = h0_eps,
+      lag = lag,
+      n_boot = n_boot,
+      lag_q = lag_q
+    )
+    
+    ul_q <- quantile(boot_q, 1 - alpha, na.rm = TRUE)
+    violations_q[m] <- q_obs > ul_q
+    
+    #### -------------------------------------------
+    #### Resíduos da série colada (modelo auto.arima fixo)
+    #### -------------------------------------------
+    s_hat <- sqrt(fit_auto$sigma2)
+    res_col <- residuos_fixos(colagem, fit_auto)
+    
+    #### 2) Resíduo (último resíduo)
+    residuo_final <- tail(res_col, 1)
+    
+    violations_res[m] <-
+      residuo_final < qnorm(alpha / 2) |
+      residuo_final > qnorm(1 - alpha / 2)
+    
+    res_novos <- tail(res_col, lag) / s_hat
+    
+    #### -------------------------------------------
+    #### 3) CUSUM bilateral (k fixo da literatura, h calibrado por bootstrap)
+    #### -------------------------------------------
+    cusum_obs <- cusum_stat(res_novos, k = k_cusum)
+    
+    boot_cusum <- bootstrap_cusum(
+      fit = fit_auto,
+      fase1 = h0,
+      eps_fase1 = h0_eps,
+      lag = lag,
+      n_boot = n_boot,
+      k = k_cusum
+    )
+    
+    h_cusum <- quantile(boot_cusum, 1 - alpha, na.rm = TRUE)
+    violations_cusum[m] <- cusum_obs > h_cusum
+    
+    #### -------------------------------------------
+    #### 4) EWMA (lambda fixo, limite calibrado por bootstrap)
+    #### -------------------------------------------
+    ewma_obs <- ewma_stat(res_novos, lambda = lambda_ewma)
+    
+    boot_ewma <- bootstrap_ewma(
+      fit = fit_auto,
+      fase1 = h0,
+      eps_fase1 = h0_eps,
+      lag = lag,
+      n_boot = n_boot,
+      lambda = lambda_ewma
+    )
+    
+    k_ewma <- quantile(boot_ewma, 1 - alpha, na.rm = TRUE)
+    violations_ewma[m] <- ewma_obs > k_ewma
+  }
+  
+  list(
+    violacoes_q     = violations_q,
+    violacoes_res   = violations_res,
+    violacoes_cusum = violations_cusum,
+    violacoes_ewma  = violations_ewma
+  )
+}
+
+
+
+#### =========================================================
+#### Paralelização
+#### =========================================================
+
+parallel_power_test <- function(n,
+                                lag,
+                                n_mc,
+                                n_boot = 500,
+                                alpha = 0.05,
+                                lag_q = 10,
+                                max.p = 2,
+                                max.q = 2,
+                                criterio = "aicc",
+                                cutoff = NULL,
+                                order = c(1,0,1),
+                                h0_model,
+                                h1_model,
+                                burn_in = 1000,
+                                lambda_ewma = 0.2,
+                                k_cusum = 0.5) {
+  
+  start.par <- Sys.time()
+  
+  cl <- makeCluster(parallel::detectCores() - 1, type = "SOCK")
+  pb <- txtProgressBar(max = n_mc, style = 3)
+  progress <- function(n) setTxtProgressBar(pb, n)
+  opts <- list(progress = progress)
+  
+  registerDoSNOW(cl)
+  
+  teste_raw <- foreach(
+    i = 1:n_mc,
+    .combine = rbind,
+    .options.snow = opts,
+    .export = c(
+      "arima_structbreak_sim", "simula_processo", "ajustar_modelos",
+      "multimodel_Q", "bootstrap_multimodelo", "power_test",
+      "residuos_fixos", "amostra_coef", "ewma_stat", "bootstrap_ewma",
+      "cusum_stat", "bootstrap_cusum"
+    ),
+    .packages = c("forecast", "mvtnorm", "binom")
+  ) %dopar% {
+    
+    power_test(
+      n = n, lag = lag, n_mc = 1, n_boot = n_boot, alpha = alpha,
+      lag_q = lag_q, max.p = max.p, max.q = max.q, criterio = criterio,
+      cutoff = cutoff, order = order, h0_model = h0_model,
+      h1_model = h1_model, burn_in = burn_in,
+      lambda_ewma = lambda_ewma, k_cusum = k_cusum
+    )
+  }
+  
+  stopCluster(cl)
+  close(pb)
+  
+  print(Sys.time() - start.par)
+  
+  extrai <- function(nm) as.numeric(unlist(teste_raw[, nm]))
+  
+  ic <- function(v) {
+    b <- binom.confint(sum(v), length(v), methods = "wilson")
+    list(li = b$lower, media = b$mean, ls = b$upper)
+  }
+  
+  list(
+    resultados_q     = ic(extrai("violacoes_q")),
+    resultados_res   = ic(extrai("violacoes_res")),
+    resultados_cusum = ic(extrai("violacoes_cusum")),
+    resultados_ewma  = ic(extrai("violacoes_ewma"))
+  )
+}
+
+
+
+#### =========================================================
+#### Tabela online de poder
+#### =========================================================
+
+online_power_table_mm <- function(lags,
+                                  h0_model,
+                                  h1_models,
+                                  n,
+                                  n_mc,
+                                  n_boot = 500,
+                                  alpha = 0.05,
+                                  lag_q = 10,
+                                  max.p = 2,
+                                  max.q = 2,
+                                  criterio = "aicc",
+                                  cutoff = NULL,
+                                  order = c(1,0,1),
+                                  burn_in = 1000,
+                                  lambda_ewma = 0.2,
+                                  k_cusum = 0.5) {
+  
+  nomes <- c("resultados_q", "resultados_res",
+             "resultados_cusum", "resultados_ewma")
+  
+  mk <- function() matrix(0, nrow = length(h1_models), ncol = length(lags))
+  
+  out <- setNames(
+    lapply(nomes, function(x) list(li = mk(), media = mk(), ls = mk())),
+    nomes
+  )
+  
+  for (i in seq_along(h1_models)) {
+    for (j in seq_along(lags)) {
+      
+      res_ij <- parallel_power_test(
+        n = n, lag = lags[j], n_mc = n_mc, n_boot = n_boot,
+        alpha = alpha, lag_q = lag_q, max.p = max.p, max.q = max.q,
+        criterio = criterio, cutoff = cutoff, order = order,
+        h0_model = h0_model, h1_model = h1_models[[i]],
+        burn_in = burn_in, lambda_ewma = lambda_ewma, k_cusum = k_cusum
+      )
+      
+      for (nm in nomes) {
+        out[[nm]]$li[i, j]    <- res_ij[[nm]]$li
+        out[[nm]]$media[i, j] <- res_ij[[nm]]$media
+        out[[nm]]$ls[i, j]    <- res_ij[[nm]]$ls
+      }
+    }
+  }
+  
+  out
+}
+
+```
+
+Simulação
+
+```{r}
+
+lags = c(1, 5, 15, 25, 50, 99)
+
+h0 = c(0.4,0.3)
+h1=c(0.6,0.5)
+h2=c(0.8,0.7)
+h3=c(0.2,0.1)
+h4=c(-0.4,-0.3)
+
+names(h0) = names(h1) = names(h2) = names(h3) = names(h4) = c("ar1","ma1")
+
+modelo_h0=h0
+modelos_h1=list(
+    h0,
+    h1,
+    h2,
+    h3,
+    h4
+  )
+
+lambda_ewma = 0.2
+
+# CUSUM: k = 0.5 (em unidades de desvio-padrão) é o valor de referência
+# usual da literatura (Page, 1954; Montgomery), ótimo para detectar
+# deslocamentos de ~1 sigma. O intervalo de decisão h é calibrado por bootstrap.
+k_cusum = 0.5
+
+set.seed(2026)
+teste1 = online_power_table_mm(
+  lags, modelo_h0, modelos_h1,
+  n = 100, n_mc = 1000, n_boot = 500,
+  lambda_ewma = lambda_ewma,
+  k_cusum = k_cusum
+)
+
+```
+
+Preparando dados
+
+```{r}
+
+cria_df_poder <- function(resultados, lags, h1_labels, nome_lista, tipo_teste) {
+  
+  r <- resultados[[nome_lista]]
+  
+  expand.grid(i = seq_along(h1_labels), j = seq_along(lags)) %>%
+    mutate(
+      modelo = h1_labels[i],
+      Lag    = lags[j],
+      Poder  = r$media[cbind(i, j)],
+      LI     = r$li[cbind(i, j)],
+      LS     = r$ls[cbind(i, j)],
+      Tipo   = tipo_teste
+    ) %>%
+    select(-i, -j)
+}
+
+h1_labels = c("ARMA(0.4,0.3)", "ARMA(0.6,0.5)", "ARMA(0.8,0.7)",
+              "ARMA(0.2,0.1)", "ARMA(-0.4,-0.3)")
+
+# rótulos das facetas (nomes) -> elementos da lista de resultados (valores)
+rotulos = c(
+  "Q Multi-Modelo",
+  "Resíduo Auto-Arima",
+  paste0("CUSUM (k = ", k_cusum, ", h bootstrap)"),
+  paste0("EWMA (\u03BB = ", lambda_ewma, ", bootstrap)")
+)
+
+tipos = setNames(
+  c("resultados_q", "resultados_res", "resultados_cusum", "resultados_ewma"),
+  rotulos
+)
+
+df_plot = bind_rows(lapply(names(tipos), function(t) {
+  cria_df_poder(teste1, lags, h1_labels,
+                nome_lista = tipos[[t]], tipo_teste = t)
+}))
+
+df_plot$Tipo   = factor(df_plot$Tipo, levels = rotulos)
+df_plot$modelo = factor(df_plot$modelo, levels = h1_labels)
+
+```
+
+Gráfico
+
+```{r}
+
+### informações do experimento
+info_experimento = paste(
+  "Modelo Fase 1 = ARMA(0.4,0.3)",
+  "Ordem = (1,0,1)",
+  "MC = 1000",
+  "Boot = 500",
+  "Alpha = 0.05",
+  "Lag Q = 10",
+  paste0("EWMA \u03BB = ", lambda_ewma),
+  paste0("CUSUM k = ", k_cusum),
+  "Lags = {1, 5, 15, 25, 50, 99}",
+  "Modelos Candidatos Q: ARMA(max.p=2,max.q=2)",
+  "SD = 1",
+  "Seed = 2026",
+  sep = " | "
+)
+
+### gráfico
+ggplot(
+  df_plot,
+  aes(x = Lag, y = Poder, color = modelo, group = modelo)
+) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.8) +
+  geom_errorbar(aes(ymin = LI, ymax = LS), width = 2, alpha = 0.45) +
+  
+  ### linha de significância
+  geom_hline(yintercept = 0.05, linetype = "dashed", linewidth = 0.8) +
+  
+  facet_wrap(~Tipo, nrow = 2) +
+  
+  scale_x_continuous(breaks = c(1, 50, 99)) +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.1)) +
+  
+  labs(
+    x = "Lag",
+    y = "Poder",
+    color = "Modelo Fase 2",
+    caption = info_experimento
+  ) +
+  
+  theme_bw(base_size = 13) +
+  
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.title = element_text(face = "bold"),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    plot.caption = element_text(hjust = 0.5, size = 7, margin = margin(t = 15))
+  ) +
+  
+  guides(color = guide_legend(nrow = 2, byrow = TRUE))
+
+```
+
+Salva
+
+```{r}
+
+ggsave("qmm_res_cusum_ewma.png",
+       plot = last_plot(),
+       device = "png",
+       dpi = 600,
+       width = 10,
+       height = 6.5,
+       units = "in",
+       bg = "white")
+
+```
